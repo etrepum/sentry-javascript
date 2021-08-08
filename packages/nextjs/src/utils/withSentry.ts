@@ -10,7 +10,7 @@ const { parseRequest } = Handlers;
 // purely for clarity
 type WrappedNextApiHandler = NextApiHandler;
 
-type AugmentedResponse = NextApiResponse & { __sentryTransaction?: Transaction };
+type AugmentedResponse = NextApiResponse & { __sentryTransaction?: Transaction, __sentryEnd?: Promise<void> };
 
 // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
 export const withSentry = (handler: NextApiHandler): WrappedNextApiHandler => {
@@ -74,7 +74,10 @@ export const withSentry = (handler: NextApiHandler): WrappedNextApiHandler => {
       }
 
       try {
-        return await handler(req, res); // Call original handler
+        const result = await handler(req, res); // Call original handler
+        // Wait for the original res.end to be called, if invoked
+        await Promise.resolve((res as AugmentedResponse).__sentryEnd);
+        return result;
       } catch (e) {
         if (currentScope) {
           currentScope.addEventProcessor(event => {
@@ -97,33 +100,35 @@ type ResponseEndMethod = AugmentedResponse['end'];
 type WrappedResponseEndMethod = AugmentedResponse['end'];
 
 function wrapEndMethod(origEnd: ResponseEndMethod): WrappedResponseEndMethod {
-  return async function newEnd(this: AugmentedResponse, ...args: unknown[]) {
+  return function newEnd(this: AugmentedResponse, ...args: unknown[]) {
     const transaction = this.__sentryTransaction;
+    this.__sentryEnd = (async () => {
 
-    if (transaction) {
-      transaction.setHttpStatus(this.statusCode);
+      if (transaction) {
+        transaction.setHttpStatus(this.statusCode);
 
-      // Push `transaction.finish` to the next event loop so open spans have a better chance of finishing before the
-      // transaction closes, and make sure to wait until that's done before flushing events
-      const transactionFinished: Promise<void> = new Promise(resolve => {
-        setImmediate(() => {
-          transaction.finish();
-          resolve();
+        // Push `transaction.finish` to the next event loop so open spans have a better chance of finishing before the
+        // transaction closes, and make sure to wait until that's done before flushing events
+        const transactionFinished: Promise<void> = new Promise(resolve => {
+          setImmediate(() => {
+            transaction.finish();
+            resolve();
+          });
         });
-      });
-      await transactionFinished;
-    }
+        await transactionFinished;
+      }
 
-    // flush the event queue to ensure that events get sent to Sentry before the response is finished and the lambda
-    // ends
-    try {
-      logger.log('Flushing events...');
-      await flush(2000);
-      logger.log('Done flushing events');
-    } catch (e) {
-      logger.log(`Error while flushing events:\n${e}`);
-    }
+      // flush the event queue to ensure that events get sent to Sentry before the response is finished and the lambda
+      // ends
+      try {
+        logger.log('Flushing events...');
+        await flush(2000);
+        logger.log('Done flushing events');
+      } catch (e) {
+        logger.log(`Error while flushing events:\n${e}`);
+      }
 
-    return origEnd.call(this, ...args);
+      return origEnd.call(this, ...args);
+    })();
   };
 }
